@@ -1,0 +1,103 @@
+name: Temporary game preview
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/game-preview.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smoothie-rush-preview
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.19.0
+          cache: npm
+      - name: Build and test the game
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          npm test
+      - name: Open a verified live preview for 30 minutes
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            https://github.com/cloudflare/cloudflared/releases/download/2026.10.0/cloudflared-linux-amd64 \
+            --output "$RUNNER_TEMP/cloudflared"
+          echo "d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db  $RUNNER_TEMP/cloudflared" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/cloudflared"
+          PORT=5173 npm start > "$RUNNER_TEMP/smoothie-server.log" 2>&1 &
+          GAME_PID=$!
+          "$RUNNER_TEMP/cloudflared" tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:5173 \
+            > "$RUNNER_TEMP/smoothie-tunnel.log" 2>&1 &
+          TUNNEL_PID=$!
+          trap 'kill "$GAME_PID" "$TUNNEL_PID" 2>/dev/null || true' EXIT
+          GAME_URL=''
+          for attempt in $(seq 1 60); do
+            GAME_URL=$(sed -nE 's/.*(https:\/\/[a-z0-9-]+\.trycloudflare\.com).*/\1/p' "$RUNNER_TEMP/smoothie-tunnel.log" | head -n 1)
+            if [ -n "$GAME_URL" ]; then break; fi
+            sleep 1
+          done
+          if [ -z "$GAME_URL" ]; then
+            cat "$RUNNER_TEMP/smoothie-tunnel.log"
+            exit 1
+          fi
+          export GAME_URL
+          curl --fail --silent --show-error --retry 12 --retry-all-errors --retry-delay 2 "$GAME_URL/api/health"
+          node --input-type=module <<'JS'
+          import { io } from 'socket.io-client';
+          import assert from 'node:assert/strict';
+          const base = process.env.GAME_URL;
+          const html = await (await fetch(base)).text();
+          assert.ok(html.includes('Smoothie Rush') && html.includes('id="app"'));
+          const script = html.match(/src="([^"]+\.js)"/)[1];
+          assert.equal((await fetch(new URL(script, base))).status, 200);
+          const a = io(base, { transports: ['websocket'] });
+          const b = io(base, { transports: ['websocket'] });
+          const wait = (socket, predicate) => new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('Public multiplayer connection timed out')), 20000);
+            const check = state => { if (predicate(state)) { clearTimeout(timer); socket.off('state', check); resolve(state); } };
+            socket.on('state', check);
+          });
+          const request = (socket, event, data = {}) => new Promise((resolve, reject) => socket.timeout(20000).emit(event, data, (error, result) => error ? reject(error) : resolve(result)));
+          try {
+            await Promise.all([wait(a, s => !!s.players[a.id]), wait(b, s => !!s.players[b.id])]);
+            const room = await request(a, 'create-room', { name: 'Preview check' });
+            assert.equal(room.ok, true);
+            assert.equal((await request(b, 'join-room', { code: room.code, name: 'Second check' })).ok, true);
+            assert.equal((await request(a, 'start')).ok, true);
+            const state = await wait(b, s => s.phase === 'playing' && Object.keys(s.players).length === 2);
+            assert.equal(state.orders.length, 3);
+            assert.ok(state.remaining > 170);
+            console.log('PASS public frontend, assets, WebSockets, room join and synchronized shift.');
+          } finally { a.disconnect(); b.disconnect(); }
+          JS
+          python3 <<'PY'
+          import json,os,datetime
+          now=datetime.datetime.now(datetime.timezone.utc)
+          data={'url':os.environ['GAME_URL'],'created_at':now.isoformat(),'expires_at':(now+datetime.timedelta(minutes=30)).isoformat(),'verified':'Frontend assets and two-player WebSocket room verified'}
+          with open('PREVIEW_URL.json','w') as f: json.dump(data,f,indent=2); f.write('\n')
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add PREVIEW_URL.json
+          git commit -m 'Publish verified temporary game preview link'
+          git push origin HEAD:main
+          echo "[Open Smoothie Rush]($GAME_URL) — available for this 30-minute review session." >> "$GITHUB_STEP_SUMMARY"
+          PREVIEW_END=$((SECONDS + 1800))
+          while [ "$SECONDS" -lt "$PREVIEW_END" ]; do
+            kill -0 "$GAME_PID" "$TUNNEL_PID"
+            sleep 30
+          done
